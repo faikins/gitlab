@@ -1,0 +1,50 @@
+stages:
+  - build
+  - publish
+  - deploy
+
+variables:
+  DOTNET_VERSION: "8.0.100"
+  PROJECT_PATH: "YourProject.csproj"
+  BUILD_OUTPUT_DIR: "artifacts"
+  PUBLISH_OUTPUT_DIR: "publish"
+
+before_script:
+  - echo "Setting up .NET SDK"
+  - dotnet --version
+
+build:
+  stage: build
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  script:
+    - echo "Restoring dependencies..."
+    - dotnet restore $PROJECT_PATH
+    - echo "Building project..."
+    - dotnet build $PROJECT_PATH --configuration Release --no-restore
+  artifacts:
+    paths:
+      - $BUILD_OUTPUT_DIR/
+
+publish:
+  stage: publish
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  script:
+    - echo "Publishing the .NET 8 application..."
+    - dotnet publish $PROJECT_PATH --configuration Release --runtime win-x64 --self-contained true --output $PUBLISH_OUTPUT_DIR
+  artifacts:
+    paths:
+      - $PUBLISH_OUTPUT_DIR/
+
+deploy:
+  stage: deploy
+  image: alpine
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - echo "Pushing artifact to Octopus Deploy..."
+    - curl -X POST "https://your-octopus-server/api/packages/raw?apikey=YOUR_API_KEY" \
+      -H "Content-Type: multipart/form-data" \
+      -F "data=@$PUBLISH_OUTPUT_DIR/YourApplication.zip"
+
+  only:
+    - main
