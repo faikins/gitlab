@@ -1,95 +1,77 @@
 #!/usr/bin/env bash
 set -euo pipefail
-CLUSTER="${1:?Usage: $0 <cluster> <service> [region] [minutes-back] [container-name] }"
-SERVICE="${2:?Usage: $0 <cluster> <service> [region] [minutes-back] [container-name] }"
-REGION="${3:-us-east-1}"
-MINUTES_BACK="${4:-60}"
-CONTAINER_FILTER="${5:-}"
-START_MS=$(( ($(date +%s) - MINUTES_BACK*60) * 1000 ))
 
-# 1) Get task definition ARN from the ECS service
-TASK_DEF=$(aws ecs describe-services \
-  --cluster "$CLUSTER" \
-  --services "$SERVICE" \
-  --region "$REGION" \
-  --query 'services[0].taskDefinition' \
-  --output text)
+CLUSTER="${1:?Usage: $0 <cluster> <service> [minutes-back] [log-group]}"
+SERVICE="${2:?Usage: $0 <cluster> <service> [minutes-back] [log-group]}"
+MINUTES_BACK="${3:-60}"
+LOG_GROUP="${4:-/aws/ecs/containertaskdefinition}"
 
-if [[ -z "$TASK_DEF" || "$TASK_DEF" == "None" ]]; then
-  echo "Could not find task definition for service=$SERVICE cluster=$CLUSTER region=$REGION"
+# Change this if you ever need a different region
+REGION="us-east-1"
+
+# FIX 2: validate MINUTES_BACK is numeric before arithmetic
+if ! [[ "$MINUTES_BACK" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: minutes-back must be a positive integer, got: '$MINUTES_BACK'"
   exit 1
 fi
-echo "Task definition: $TASK_DEF"
-echo
 
-# 2) Get container definitions as raw JSON, then extract fields with jq
-# FIX: Removed the broken --query with dotted nested paths; use --output json + jq instead
-CONTAINERS_JSON=$(aws ecs describe-task-definition \
-  --task-definition "$TASK_DEF" \
+START_MS=$(( ($(date +%s) - MINUTES_BACK * 60) * 1000 ))
+
+# Derive container name: strip leading "<number>-" and trailing "-ecs-fargate"
+# 11122233-sustain-ui-be-dark-prod-ecs-fargate → sustain-ui-be-dark-prod
+CONTAINER_NAME="${CLUSTER#*-}"
+CONTAINER_NAME="${CONTAINER_NAME%-ecs-fargate}"
+
+# Derive task definition: replace trailing "-ecs-fargate" with "-task-definition"
+# 11122233-sustain-ui-be-dark-prod-ecs-fargate → 11122233-sustain-ui-be-dark-prod-task-definition
+TASK_DEF="${CLUSTER%-ecs-fargate}-task-definition"
+
+# FireLens stream pattern: ecs/<container-name>-firelens-<task-id>
+STREAM_PREFIX="ecs/${CONTAINER_NAME}-firelens"
+
+echo "======================================================"
+echo "Cluster      : $CLUSTER"
+echo "Service      : $SERVICE"
+echo "Region       : $REGION"
+echo "Container    : $CONTAINER_NAME    (derived)"
+echo "Task def     : $TASK_DEF          (derived)"
+echo "Log group    : $LOG_GROUP"
+echo "Stream prefix: $STREAM_PREFIX"
+echo "Time window  : last $MINUTES_BACK minutes"
+echo "======================================================"
+
+# FIX 3: verify task definition with a clear error if AWS call itself fails
+echo "Verifying task definition..."
+if ! aws ecs describe-task-definition \
+     --task-definition "$TASK_DEF" \
+     --region "$REGION" \
+     --query 'taskDefinition.taskDefinitionArn' \
+     --output text 2>/dev/null; then
+  echo "WARNING: Could not verify task definition '$TASK_DEF' — check cluster name or AWS credentials."
+  echo "         Proceeding with log fetch anyway..."
+fi
+echo ""
+
+# FIX 4: capture event count and report if empty
+echo "Fetching logs..."
+RESULTS=$(aws logs filter-log-events \
+  --log-group-name "$LOG_GROUP" \
+  --log-stream-name-prefix "$STREAM_PREFIX" \
+  --start-time "$START_MS" \
   --region "$REGION" \
-  --output json \
-  | jq '[.taskDefinition.containerDefinitions[] | {
-      name:         .name,
-      logGroup:     (.logConfiguration.options."awslogs-group"     // ""),
-      streamPrefix: (.logConfiguration.options."awslogs-stream-prefix" // "")
-    }]')
+  --output json)
 
-echo "$CONTAINERS_JSON" | jq -c '.[]' | while read -r row; do
-  NAME=$(echo "$row" | jq -r '.name')
-  LOG_GROUP=$(echo "$row" | jq -r '.logGroup // empty')
-  STREAM_PREFIX=$(echo "$row" | jq -r '.streamPrefix // empty')
+EVENT_COUNT=$(echo "$RESULTS" | jq '[.events[]?] | length')
 
-  if [[ -n "$CONTAINER_FILTER" && "$NAME" != "$CONTAINER_FILTER" ]]; then
-    continue
-  fi
+if [[ "$EVENT_COUNT" -eq 0 ]]; then
+  echo "No log events found for container '$CONTAINER_NAME' in the last $MINUTES_BACK minutes."
+  echo "Try increasing the time window: $0 $CLUSTER $SERVICE 120"
+  exit 0
+fi
 
-  if [[ -z "$LOG_GROUP" ]]; then
-    echo "Skipping container '$NAME' because no awslogs-group is configured."
-    continue
-  fi
-
-  echo "======================================================"
-  echo "Container    : $NAME"
-  echo "Log group    : $LOG_GROUP"
-  echo "Stream prefix: $STREAM_PREFIX"
-  echo "Time window  : last $MINUTES_BACK minutes"
-  echo "======================================================"
-
-  if [[ -n "$STREAM_PREFIX" ]]; then
-    aws logs filter-log-events \
-      --log-group-name "$LOG_GROUP" \
-      --log-stream-name-prefix "${STREAM_PREFIX}/${NAME}" \
-      --start-time "$START_MS" \
-      --region "$REGION" \
-      --output json | jq -r '
-        .events[]? |
-        "\(.timestamp/1000 | strftime("%Y-%m-%d %H:%M:%S"))  \(.logStreamName)\n\(.message)\n"
-      '
-  else
-    aws logs filter-log-events \
-      --log-group-name "$LOG_GROUP" \
-      --start-time "$START_MS" \
-      --region "$REGION" \
-      --output json | jq -r '
-        .events[]? |
-        select(.logStreamName | contains("'"$NAME"'")) |
-        "\(.timestamp/1000 | strftime("%Y-%m-%d %H:%M:%S"))  \(.logStreamName)\n\(.message)\n"
-      '
-  fi
-  echo
-done
-
-
-
-
-
-
-# Peek at stream names in your log group to see the actual pattern
-aws logs describe-log-streams \
-  --log-group-name "/aws/ecs/containertaskdefinition" \
-  --region us-east-1 \
-  --order-by LastEventTime \
-  --descending \
-  --max-items 20 \
-  --query 'logStreams[*].logStreamName' \
-  --output table
+echo "Found $EVENT_COUNT log events:"
+echo ""
+echo "$RESULTS" | jq -r '
+  .events[]? |
+  "\(.timestamp/1000 | strftime("%Y-%m-%d %H:%M:%S"))  \(.logStreamName)\n\(.message)\n"
+'
