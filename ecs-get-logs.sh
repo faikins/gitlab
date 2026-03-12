@@ -78,3 +78,18 @@ echo "$CONTAINERS_JSON" | jq -c '.[]' | while read -r row; do
   fi
   echo
 done
+
+
+
+
+
+
+# Peek at stream names in your log group to see the actual pattern
+aws logs describe-log-streams \
+  --log-group-name "/aws/ecs/containertaskdefinition" \
+  --region us-east-1 \
+  --order-by LastEventTime \
+  --descending \
+  --max-items 20 \
+  --query 'logStreams[*].logStreamName' \
+  --output table
