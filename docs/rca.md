@@ -38,3 +38,5 @@ sequenceDiagram
         CTR-->>ECS: Restart healthy in about 10 to 12 min
     end
 ```
+
+**Explanation:** Because this is a Servlet 2.5 application that already uses `web.xml`, adding `metadata-complete="true"` allowed GlassFish to skip servlet annotation scanning during autodeploy, which restored normal restart behavior in ECS Fargate.
