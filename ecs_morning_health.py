@@ -53,6 +53,7 @@ class ServiceHealth:
     task_definition: str
     rollout_state: str
     rollout_reason: str
+    last_deployed: str
     status: str
     summary: str
 
@@ -175,6 +176,8 @@ def classify_service(service: dict, cluster_name: str) -> ServiceHealth:
     primary = extract_primary_deployment(service)
     rollout_state = primary.get("rolloutState", "")
     rollout_reason = primary.get("rolloutStateReason", "")
+    created_at = primary.get("createdAt")
+    last_deployed = created_at.strftime("%Y-%m-%d %H:%M UTC") if created_at else "-"
 
     # --- Base classification ---
     if desired_count == 0:
@@ -215,6 +218,7 @@ def classify_service(service: dict, cluster_name: str) -> ServiceHealth:
         task_definition=task_definition,
         rollout_state=rollout_state,
         rollout_reason=rollout_reason,
+        last_deployed=last_deployed,
         status=status,
         summary=summary,
     )
@@ -306,6 +310,7 @@ def print_summary_table(rows: List[ServiceHealth]) -> None:
         "PENDING",
         "TASKDEF",
         "ROLLOUT",
+        "LAST DEPLOYED",
         "SUMMARY",
     ]
 
@@ -322,6 +327,7 @@ def print_summary_table(rows: List[ServiceHealth]) -> None:
                 str(row.pending_count),
                 truncate(row.task_definition, MAX_TASKDEF_WIDTH),
                 row.rollout_state or "-",
+                row.last_deployed,
                 truncate(row.summary, MAX_SUMMARY_WIDTH),
             ]
         )
