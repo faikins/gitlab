@@ -24,6 +24,7 @@ Optional:
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
@@ -86,6 +87,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--profile",
         help="Optional AWS CLI profile name.",
+    )
+    parser.add_argument(
+        "--csv",
+        action="store_true",
+        help="Output results as CSV instead of a formatted table.",
     )
     return parser.parse_args()
 
@@ -295,6 +301,22 @@ def truncate(value: str, max_width: int) -> str:
     return value[: max_width - 1] + "…"
 
 
+def print_csv(rows: List[ServiceHealth]) -> None:
+    writer = csv.writer(sys.stdout)
+    writer.writerow([
+        "status", "cluster", "service", "launch_type",
+        "running", "desired", "pending", "task_definition",
+        "rollout_state", "last_deployed", "summary",
+    ])
+    for row in rows:
+        writer.writerow([
+            row.status, row.cluster_name, row.service_name, row.launch_type,
+            row.running_count, row.desired_count, row.pending_count,
+            row.task_definition, row.rollout_state or "",
+            row.last_deployed, row.summary,
+        ])
+
+
 def print_summary_table(rows: List[ServiceHealth]) -> None:
     if not rows:
         print("No services found.")
@@ -400,9 +422,13 @@ def main() -> int:
         )
     )
 
-    print(f"\nECS Morning Health Summary | region={args.region}\n")
-    print_summary_table(all_rows)
-    print_totals(all_rows)
+    if not args.csv:
+        print(f"\nECS Morning Health Summary | region={args.region}\n")
+    if args.csv:
+        print_csv(all_rows)
+    else:
+        print_summary_table(all_rows)
+        print_totals(all_rows)
 
     has_red = any(r.status == STATUS_RED for r in all_rows)
     return 2 if has_red else 0
