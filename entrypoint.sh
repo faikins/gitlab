@@ -1,17 +1,19 @@
 #!/bin/sh
 set -eu
 
-: "${S3_BUCKET:?S3_BUCKET is required}"
-: "${KMS_KEY_ID:?KMS_KEY_ID is required}"
-
+S3_SYNC_ENABLED="${S3_SYNC_ENABLED:-true}"
 SYNC_INTERVAL="${SYNC_INTERVAL:-900}"
 LOG_PATH="${LOG_PATH:-/logs}"
 UPLOAD_PATH="${UPLOAD_PATH:-/logs/.to_upload}"
 S3_PREFIX="${S3_PREFIX:-active}"
 LOGROTATE_CONF="${LOGROTATE_CONF:-/etc/logrotate.d/middleware_logs}"
-
-# Match your middleware log pattern, for example: mw.log.container
 LOG_GLOB="${LOG_GLOB:-*.container}"
+
+# S3 vars only required when sync is enabled
+if [ "$S3_SYNC_ENABLED" = "true" ]; then
+    : "${S3_BUCKET:?S3_BUCKET is required when S3_SYNC_ENABLED=true}"
+    : "${KMS_KEY_ID:?KMS_KEY_ID is required when S3_SYNC_ENABLED=true}"
+fi
 
 mkdir -p "$LOG_PATH"
 mkdir -p "$UPLOAD_PATH"
@@ -21,7 +23,7 @@ echo "[$(date)] Creating logrotate config at ${LOGROTATE_CONF}"
 
 cat > "$LOGROTATE_CONF" <<EOF
 ${LOG_PATH}/${LOG_GLOB} {
-    rotate 96
+    rotate 8
     missingok
     ifempty
     copytruncate
@@ -32,23 +34,19 @@ ${LOG_PATH}/${LOG_GLOB} {
 }
 EOF
 
-echo "[$(date)] Logrotate config:"
-cat "$LOGROTATE_CONF"
-
-run_rotate_and_upload() {
-    # Stable S3 path: active/<date>/<hostname>/ — no per-run timestamp folder
-    S3_DEST="s3://${S3_BUCKET}/${S3_PREFIX}/$(date +%Y%m%d)/$(hostname)"
-
+run_logrotate() {
     echo "[$(date)] Starting forced logrotate..."
     /usr/sbin/logrotate -vf "$LOGROTATE_CONF" 2>&1
     LOGROTATE_RC=$?
-
     if [ "$LOGROTATE_RC" -ne 0 ]; then
-        echo "[$(date)] logrotate failed with exit code ${LOGROTATE_RC}. Skipping S3 upload."
+        echo "[$(date)] logrotate failed with exit code ${LOGROTATE_RC}."
         return "$LOGROTATE_RC"
     fi
+    echo "[$(date)] logrotate completed."
+}
 
-    echo "[$(date)] logrotate completed. Checking files staged for upload..."
+run_upload() {
+    S3_DEST="s3://${S3_BUCKET}/${S3_PREFIX}/$(date +%Y%m%d)/$(hostname)"
 
     if ! find "$UPLOAD_PATH" -type f -print -quit | grep -q .; then
         echo "[$(date)] No files found in ${UPLOAD_PATH}. Nothing to upload."
@@ -59,39 +57,47 @@ run_rotate_and_upload() {
     find "$UPLOAD_PATH" -type f -exec ls -lh {} \;
 
     echo "[$(date)] Uploading staged logs from ${UPLOAD_PATH} to ${S3_DEST}..."
-
     aws s3 cp "$UPLOAD_PATH" "$S3_DEST" \
         --recursive \
         --sse aws:kms \
         --sse-kms-key-id "$KMS_KEY_ID"
+}
 
-    UPLOAD_RC=$?
+cleanup_upload_path() {
+    find "$UPLOAD_PATH" -type f -delete
+    find "$UPLOAD_PATH" -type d -empty -delete 2>/dev/null || true
+    mkdir -p "$UPLOAD_PATH"
+    echo "[$(date)] Cleanup completed."
+}
 
-    if [ "$UPLOAD_RC" -eq 0 ]; then
-        echo "[$(date)] S3 upload succeeded. Cleaning up uploaded staged files..."
+run_cycle() {
+    if [ "$S3_SYNC_ENABLED" = "true" ]; then
+        # Upload staged files from previous cycle first, rotate only on success
+        run_upload
+        UPLOAD_RC=$?
 
-        find "$UPLOAD_PATH" -type f -delete
-        find "$UPLOAD_PATH" -type d -empty -delete 2>/dev/null || true
-        mkdir -p "$UPLOAD_PATH"
-
-        echo "[$(date)] Cleanup completed."
+        if [ "$UPLOAD_RC" -eq 0 ]; then
+            echo "[$(date)] S3 upload succeeded. Cleaning up staged files..."
+            cleanup_upload_path
+            run_logrotate || return $?
+        else
+            echo "[$(date)] S3 upload failed with exit code ${UPLOAD_RC}. Keeping staged files for retry. Skipping logrotate."
+            return "$UPLOAD_RC"
+        fi
     else
-        echo "[$(date)] S3 upload failed with exit code ${UPLOAD_RC}. Keeping staged files for retry."
-        return "$UPLOAD_RC"
+        # S3 disabled — rotate and immediately clean up staged files
+        echo "[$(date)] S3_SYNC_ENABLED=false. Running logrotate only..."
+        run_logrotate || return $?
+        cleanup_upload_path
     fi
 }
 
-trap 'echo "[$(date)] Caught signal, running final rotate/upload..."; run_rotate_and_upload; exit 0' TERM INT
+trap 'echo "[$(date)] Caught signal, running final cycle..."; run_cycle; exit 0' TERM INT
 
 echo "Sidecar starting."
-echo "LOG_PATH=${LOG_PATH}"
-echo "UPLOAD_PATH=${UPLOAD_PATH}"
-echo "LOG_GLOB=${LOG_GLOB}"
-echo "S3_PREFIX=${S3_PREFIX}"
-echo "SYNC_INTERVAL=${SYNC_INTERVAL}"
 
 while true; do
-    run_rotate_and_upload || true
+    run_cycle || true
     sleep "$SYNC_INTERVAL" &
     wait $!
 done
