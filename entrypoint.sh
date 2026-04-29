@@ -53,6 +53,15 @@ run_upload() {
         return 0
     fi
 
+    # Remove zero-byte files — no value uploading empty logs
+    find "$UPLOAD_PATH" -type f -empty -delete
+    echo "[$(date)] Removed empty staged files."
+
+    if ! find "$UPLOAD_PATH" -type f -print -quit | grep -q .; then
+        echo "[$(date)] All staged files were empty. Nothing to upload."
+        return 0
+    fi
+
     echo "[$(date)] Files staged for upload:"
     find "$UPLOAD_PATH" -type f -exec ls -lh {} \;
 
